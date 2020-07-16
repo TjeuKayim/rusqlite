@@ -54,6 +54,9 @@ mod build_bundled {
                 .expect("Could not copy bindings to output directory");
         }
 
+        println!("cargo:rerun-if-changed=sqlite3/simple.c");
+        println!("cargo:rerun-if-changed=sqlite3/sqlite3.c");
+
         let mut cfg = cc::Build::new();
         if env::var("TARGET") == Ok("wasm32-wasi".to_string()) {
             // inspired by https://github.com/wapm-packages/sqlite
@@ -64,10 +67,18 @@ mod build_bundled {
                 .file("sqlite3/os.c")
                 .flag("-DSQLITE_THREADSAFE=0")
                 .flag("-DSQLITE_OS_OTHER")
+                .flag("-DLONGDOUBLE_TYPE=double")
+                // .flag("-DSQLITE_OMIT_WSD")
+                // .flag("-DSQLITE_OMIT_FLOATING_POINT")
+                // https://www.sqlite.org/compile.html#omitfeatures
+                // these options may only be used when the library is built from canonical source, not from the amalgamation
                 .flag("-DNDEBUG")
+                // .flag("-nostartfiles")
+                // .ar_flag("-Wl,--no-entry")
+                // .ar_flag("-Wl,--allow-undefined")
+                // .ar_flag("-Wl,--no-threads")
+                // .ar_flag("--sysroot=/opt/wasi-sdk/share/wasi-sysroot")
                 ;
-                // ;
-            // println!("cargo:rustc-cdylib-link-arg=-Wl,--no-entry")
         } else {
             cfg.file("sqlite3/sqlite3.c")
                 .flag("-DSQLITE_CORE")
@@ -88,25 +99,25 @@ mod build_bundled {
                 .flag("-DSQLITE_USE_URI")
                 .flag("-DSQLITE_THREADSAFE=1")
                 .flag("-DHAVE_USLEEP=1");
-        }
-        // Older versions of visual studio don't support c99 (including isnan), which
-        // causes a build failure when the linker fails to find the `isnan`
-        // function. `sqlite` provides its own implmentation, using the fact
-        // that x != x when x is NaN.
-        //
-        // There may be other platforms that don't support `isnan`, they should be
-        // tested for here.
-        if cfg!(target_env = "msvc") {
-            use cc::windows_registry::{find_vs_version, VsVers};
-            let vs_has_nan = match find_vs_version() {
-                Ok(ver) => ver != VsVers::Vs12,
-                Err(_msg) => false,
-            };
-            if vs_has_nan {
+            // Older versions of visual studio don't support c99 (including isnan), which
+            // causes a build failure when the linker fails to find the `isnan`
+            // function. `sqlite` provides its own implmentation, using the fact
+            // that x != x when x is NaN.
+            //
+            // There may be other platforms that don't support `isnan`, they should be
+            // tested for here.
+            if cfg!(target_env = "msvc") {
+                use cc::windows_registry::{find_vs_version, VsVers};
+                let vs_has_nan = match find_vs_version() {
+                    Ok(ver) => ver != VsVers::Vs12,
+                    Err(_msg) => false,
+                };
+                if vs_has_nan {
+                    cfg.flag("-DSQLITE_HAVE_ISNAN");
+                }
+            } else {
                 cfg.flag("-DSQLITE_HAVE_ISNAN");
             }
-        } else {
-            cfg.flag("-DSQLITE_HAVE_ISNAN");
         }
         if cfg!(feature = "unlock_notify") {
             cfg.flag("-DSQLITE_ENABLE_UNLOCK_NOTIFY");
