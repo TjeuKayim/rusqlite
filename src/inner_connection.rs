@@ -368,6 +368,11 @@ static SQLITE_INIT: Once = Once::new();
 pub static BYPASS_SQLITE_INIT: AtomicBool = AtomicBool::new(false);
 
 fn ensure_safe_sqlite_threading_mode() -> Result<()> {
+    // the wasm32-wasi target does not support multi-threading and lacks <pthread.h>
+    if dbg!(cfg!(all(target_arch = "wasm32", target_os = "wasi"))) {
+        return Ok(());
+    }
+
     // Ensure SQLite was compiled in thredsafe mode.
     if unsafe { ffi::sqlite3_threadsafe() == 0 } {
         return Err(Error::SqliteSingleThreadedMode);
