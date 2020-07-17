@@ -7,11 +7,6 @@ use std::mem;
 
 mod error;
 
-extern {
-    pub fn add(a: i32, b: i32) -> i32;
-    pub fn foo(a: i32) -> *mut i32;
-}
-
 pub fn SQLITE_STATIC() -> sqlite3_destructor_type {
     None
 }

@@ -59,9 +59,7 @@ mod build_bundled {
 
         let mut cfg = cc::Build::new();
         if env::var("TARGET") == Ok("wasm32-wasi".to_string()) {
-            // inspired by https://github.com/wapm-packages/sqlite
             cfg
-                .file("sqlite3/simple.c")
                 .file("sqlite3/sqlite3.c")
                 .file("sqlite3/vfs.c")
                 .file("sqlite3/os.c")
@@ -83,17 +81,8 @@ mod build_bundled {
                 .flag("-DSQLITE_USE_URI")
                 .flag("-DSQLITE_THREADSAFE=1")
                 .flag("-DHAVE_USLEEP=1")
-                // .flag("-DSQLITE_THREADSAFE=0")
-                // .flag("-DSQLITE_MUTEX_NOOP")
-                // .flag("-DSQLITE_MUTEX_PTHREADS")
                 .flag("-DSQLITE_OS_OTHER")
-                .flag("-DLONGDOUBLE_TYPE=double")
-                // .flag("-DSQLITE_OMIT_WSD")
-                // .flag("-DSQLITE_OMIT_FLOATING_POINT")
-                // https://www.sqlite.org/compile.html#omitfeatures
-                // these options may only be used when the library is built from canonical source, not from the amalgamation
-                .flag("-DNDEBUG")
-                ;
+                .flag("-DLONGDOUBLE_TYPE=double");
         } else {
             cfg.file("sqlite3/sqlite3.c")
                 .flag("-DSQLITE_CORE")
