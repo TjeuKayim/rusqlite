@@ -104,6 +104,8 @@ mod column;
 pub mod config;
 #[cfg(any(feature = "functions", feature = "vtab"))]
 mod context;
+#[cfg(any(feature = "deserialize"))]
+pub mod deserialize;
 #[cfg(feature = "functions")]
 pub mod functions;
 #[cfg(feature = "hooks")]
@@ -299,6 +301,7 @@ pub enum DatabaseName<'a> {
     feature = "backup",
     feature = "blob",
     feature = "session",
+    feature = "deserialize",
     feature = "modern_sqlite"
 ))]
 impl DatabaseName<'_> {
