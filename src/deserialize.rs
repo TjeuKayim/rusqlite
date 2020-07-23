@@ -29,11 +29,12 @@
 //!
 //! Alternatively, consider using the [Backup API](./backup/).
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::{alloc, fmt, iter, mem, ops, slice};
 
-use super::ffi;
+use crate::ffi;
 use crate::{Connection, DatabaseName, Result};
 
 impl Connection {
@@ -54,7 +55,7 @@ impl Connection {
     /// Wraps the `Connection` in `BorrowingConnection` to connect it to borrowed serialized memory
     /// using [`BorrowingConnection::deserialize_read_only`].
     pub fn into_borrowing(self) -> BorrowingConnection<'static> {
-        BorrowingConnection(self, PhantomData)
+        BorrowingConnection::new(self)
     }
 
     /// Disconnect from database and reopen as an in-memory database based on the serialization data.
@@ -148,26 +149,75 @@ impl Connection {
 /// Wrap `Connection` with lifetime constraint to borrow from serialized memory.
 /// Use [`Connection::into_borrowing`] to obtain one.
 #[derive(Debug)]
-pub struct BorrowingConnection<'a>(Connection, PhantomData<&'a [u8]>);
+pub struct BorrowingConnection<'a> {
+    conn: Connection,
+    mut_slices: HashMap<DatabaseName<'a>, *mut Vec<u8>>,
+    phantom: PhantomData<&'a [u8]>,
+}
 
 impl<'a> BorrowingConnection<'a> {
+    fn new(conn: Connection) -> Self {
+        BorrowingConnection {
+            conn,
+            mut_slices: HashMap::new(),
+            phantom: PhantomData,
+        }
+    }
+
     /// Disconnect from database and reopen as an read-only in-memory database based on a borrowed slice
     /// (using the flag [`ffi::SQLITE_DESERIALIZE_READONLY`]).
     pub fn deserialize_read_only(&mut self, db: DatabaseName<'_>, data: &'a [u8]) -> Result<()> {
         unsafe { self.deserialize_with_flags(db, data, data.len(), DeserializeFlags::READ_ONLY) }
+    }
+
+    /// Disconnect from database and reopen as an in-memory database based on a borrowed vector.
+    /// If the capacity is reached, SQLite can't reallocate, so it throws [`crate::ErrorCode::DiskFull`].
+    /// Before the connection drops, the vector length is updated.
+    pub fn deserialize_borrow(
+        &mut self,
+        db: DatabaseName<'a>,
+        data: &'a mut Vec<u8>,
+    ) -> Result<()> {
+        if let Some(prev) = self.mut_slices.insert(db, data as *mut _) {
+            Self::update_serialized_len(&mut self.conn, db, prev);
+        }
+        unsafe { self.deserialize_with_flags(db, data, data.len(), DeserializeFlags::empty()) }
+    }
+
+    fn update_serialized_len(conn: &mut Connection, db: DatabaseName<'a>, vec: *mut Vec<u8>) {
+        // SQLite could have grown or shrunk the database length,
+        // but could also have detached it.
+        let new_len = if let Ok(Some(new)) = conn.serialize_no_copy(db) {
+            new.len()
+        } else {
+            // On failure, the safest thing to do is setting the length to zero.
+            // This way no uninitialized memory is exposed.
+            0
+        };
+        unsafe {
+            (*vec).set_len(new_len);
+        }
+    }
+}
+
+impl Drop for BorrowingConnection<'_> {
+    fn drop(&mut self) {
+        for (db, vec) in self.mut_slices.iter_mut() {
+            Self::update_serialized_len(&mut self.conn, *db, *vec);
+        }
     }
 }
 
 impl ops::Deref for BorrowingConnection<'_> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
-        &self.0
+        &self.conn
     }
 }
 
 impl ops::DerefMut for BorrowingConnection<'_> {
     fn deref_mut(&mut self) -> &mut Connection {
-        &mut self.0
+        &mut self.conn
     }
 }
 
