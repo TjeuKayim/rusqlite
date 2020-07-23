@@ -151,7 +151,7 @@ impl Connection {
 #[derive(Debug)]
 pub struct BorrowingConnection<'a> {
     conn: Connection,
-    mut_slices: HashMap<DatabaseName<'a>, *mut Vec<u8>>,
+    mut_slices: HashMap<DatabaseName<'a>, *mut dyn ResizableBytes>,
     phantom: PhantomData<&'a [u8]>,
 }
 
@@ -173,18 +173,18 @@ impl<'a> BorrowingConnection<'a> {
     /// Disconnect from database and reopen as an in-memory database based on a borrowed vector.
     /// If the capacity is reached, SQLite can't reallocate, so it throws [`crate::ErrorCode::DiskFull`].
     /// Before the connection drops, the vector length is updated.
-    pub fn deserialize_borrow(
+    pub fn deserialize_mut(
         &mut self,
         db: DatabaseName<'a>,
-        data: &'a mut Vec<u8>,
+        data: &'a mut impl ResizableBytes,
     ) -> Result<()> {
-        if let Some(prev) = self.mut_slices.insert(db, data as *mut _) {
+        if let Some(prev) = self.mut_slices.insert(db, data) {
             Self::update_serialized_len(&mut self.conn, db, prev);
         }
-        unsafe { self.deserialize_with_flags(db, data, data.len(), DeserializeFlags::empty()) }
+        unsafe { self.deserialize_with_flags(db, data, data.capacity(), DeserializeFlags::empty()) }
     }
 
-    fn update_serialized_len(conn: &mut Connection, db: DatabaseName<'a>, vec: *mut Vec<u8>) {
+    fn update_serialized_len(conn: &mut Connection, db: DatabaseName<'a>, vec: *mut dyn ResizableBytes) {
         // SQLite could have grown or shrunk the database length,
         // but could also have detached it.
         let new_len = if let Ok(Some(new)) = conn.serialize_no_copy(db) {
@@ -356,6 +356,30 @@ impl fmt::Debug for SerializedDb {
             .field("len", &self.len)
             .field("cap", &self.cap)
             .finish()
+    }
+}
+
+/// Resizable vector of bytes
+pub trait ResizableBytes: ops::Deref<Target=[u8]> + ops::DerefMut + fmt::Debug + 'static {
+    /// Set length.
+    unsafe fn set_len(&mut self, new_len: usize);
+    /// Get capacity.
+    fn capacity(&self) -> usize;
+}
+impl ResizableBytes for Vec<u8> {
+    unsafe fn set_len(&mut self, new_len: usize) {
+        self.set_len(new_len);
+    }
+    fn capacity(&self) -> usize {
+        self.capacity()
+    }
+}
+impl ResizableBytes for SerializedDb {
+    unsafe fn set_len(&mut self, new_len: usize) {
+        self.set_len(new_len);
+    }
+    fn capacity(&self) -> usize {
+        self.capacity()
     }
 }
 
@@ -538,6 +562,31 @@ mod test {
         // should be read-only
         let sql = "INSERT INTO foo VALUES(4)";
         db.execute_batch(sql).unwrap_err();
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_deserialize_mutable() -> Result<()> {
+        let sql = "BEGIN;
+            CREATE TABLE hello(x INTEGER);
+            INSERT INTO hello VALUES(1);
+            INSERT INTO hello VALUES(2);
+            INSERT INTO hello VALUES(3);
+            END;";
+        let one = Connection::open_in_memory()?;
+        one.execute_batch(sql)?;
+        let mut serialized_one = one.serialize(DatabaseName::Main)?.unwrap();
+
+        // create a new db and import the serialized data
+        let mut db = Connection::open_in_memory()?.into_borrowing();
+        db.deserialize_mut(DatabaseName::Main, &mut serialized_one)?;
+        let mut query = db.prepare("SELECT x FROM hello")?;
+        let results: Result<Vec<u16>> = query.query_map(NO_PARAMS, |row| row.get(0))?.collect();
+        assert_eq!(vec![1, 2, 3], results?);
+        // should not be read-only
+        let sql = "INSERT INTO hello VALUES(4)";
+        db.execute_batch(sql)?;
+        // TODO: test growing
         Ok(())
     }
 }
