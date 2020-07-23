@@ -1,8 +1,17 @@
 //! `feature = "deserialize"` Serialize and deserialize interfaces.
 //!
 //! This API is only available when SQLite is compiled with `SQLITE_ENABLE_DESERIALIZE`.
-//! These functions create and read a serialized file in-memory, useful on platforms without a real file system
-//! like WebAssembly or Cloud Functions.
+//! These functions create and read a serialized file in-memory, useful on platforms without
+//! a real file system like WebAssembly or Cloud Functions.
+//!
+//! For large in-memory database files, you probably don't want to copy or reallocate
+//! because that would temporarily double the required memory. Possible solutions:
+//!
+//! * While downloading a `.sqlite` file, write the buffers directly to [`SerializedDb`]
+//!   and pass that to [`Connection::deserialize`]
+//!   (ownership is tranferred to SQLite without copying).
+//! * Let SQLite borrow a large Rust-allocated vector using
+//!   [`BorrowingConnection::deserialize_read_only`].
 //!
 //! ```
 //! # use rusqlite::{Result, Connection, DatabaseName, NO_PARAMS};
