@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::{alloc, fmt, iter, mem, ops, slice};
+use std::{alloc, fmt, iter, mem, ops, slice, ptr};
 
 use crate::ffi;
 use crate::{Connection, DatabaseName, Result};
@@ -175,7 +175,28 @@ impl<'a> BorrowingConnection<'a> {
         T: ResizableBytes + 'a,
     {
         let data_ptr = data as *mut T;
-        let set_len = Box::new(move |new_len| unsafe { (*data_ptr).set_len(new_len) });
+        let c = self.db.borrow().db();
+        let schema = db.to_cstring()?;
+
+        let set_len = Box::new(move |new_len: usize| unsafe {
+            #[repr(C)]
+            struct MemFile {
+                base: ffi::sqlite3_file,
+                /// Size of the file
+                sz: ffi::sqlite3_int64,
+                szAlloc: ffi::sqlite3_int64,
+                szMax: ffi::sqlite3_int64,
+                aData: *mut u8,
+                nMmap: std::os::raw::c_int,
+                eLock: std::os::raw::c_int,
+            }
+            let p = ptr::null_mut::<MemFile>();
+            let rc = ffi::sqlite3_file_control(c, schema.as_ptr(), ffi::SQLITE_FCNTL_FILE_POINTER, p as _);
+            if rc == 0 {
+                (*p).sz = new_len as _;
+            }
+            (*data_ptr).set_len(new_len);
+        });
         if let Some(mut prev) = self.mut_slices.insert(db, set_len) {
             Self::update_serialized_len(&mut self.conn, db, &mut prev);
         }
@@ -647,7 +668,16 @@ mod test {
         } else {
             panic!("should return SqliteFailure");
         }
-
+        // connection close should update length of serialized2
+        let new_len = serialize_len(&mut db3);
+        assert!(new_len > initial_len);
+        mem::drop(db3);
+        assert_eq!(new_len, serialized2.len());
+        
+        // if serialized2 no longer borrows, db2 can be used again
+        mem::drop(serialized2);
+        let count: u16 = db2.query_row("SELECT COUNT(*) FROM hello", NO_PARAMS, |r| r.get(0))?;
+        dbg!(count);
         Ok(())
     }
 
