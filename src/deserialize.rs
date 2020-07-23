@@ -170,11 +170,11 @@ impl<'a> BorrowingConnection<'a> {
     /// Disconnect from database and reopen as an in-memory database based on a borrowed vector.
     /// If the capacity is reached, SQLite can't reallocate, so it throws [`crate::ErrorCode::DiskFull`].
     /// Before the connection drops, the vector length is updated.
-    pub fn deserialize_mut(
+    pub fn deserialize_mut<T>(
         &mut self,
         db: DatabaseName<'a>,
-        data: &'a mut impl ResizableBytes,
-    ) -> Result<()> {
+        data: &'a mut T,
+    ) -> Result<()> where T: ResizableBytes + 'static {
         if let Some(prev) = self.mut_slices.insert(db, data) {
             Self::update_serialized_len(&mut self.conn, db, prev);
         }
@@ -259,30 +259,6 @@ impl SerializedDb {
         SerializedDb { data, len, cap }
     }
 
-    /// Number of bytes in the deserialization.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns if `len()` equals zero.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Set `len`, the number of bytes in the deserialization.
-    /// # Safety
-    /// This can expose uninitialized memory when increasing the length.
-    /// `len` must not overflows the capacity.
-    pub unsafe fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= self.cap, "len overflows capacity");
-        self.len = len;
-    }
-
-    /// The number of allocated bytes.
-    pub fn capacity(&self) -> usize {
-        self.cap
-    }
-
     /// Grow or shrink the allocation.
     /// `len` is capped if it would overflow.
     pub fn set_capacity(&mut self, cap: usize) {
@@ -310,9 +286,19 @@ impl SerializedDb {
     }
 }
 
-impl Default for SerializedDb {
-    fn default() -> Self {
-        Self::new()
+impl ResizableBytes for SerializedDb {
+    /// Set `len`, the number of bytes in the deserialization.
+    /// # Safety
+    /// This can expose uninitialized memory when increasing the length.
+    /// `len` must not overflows the capacity.
+    unsafe fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= self.cap, "len overflows capacity");
+        self.len = len;
+    }
+
+    /// The number of allocated bytes.
+    fn capacity(&self) -> usize {
+        self.cap
     }
 }
 
@@ -335,15 +321,19 @@ impl iter::Extend<u8> for SerializedDb {
 
 impl ops::Deref for SerializedDb {
     type Target = [u8];
-
     fn deref(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len) }
     }
 }
-
 impl ops::DerefMut for SerializedDb {
     fn deref_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
+    }
+}
+
+impl Default for SerializedDb {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -356,8 +346,7 @@ impl fmt::Debug for SerializedDb {
     }
 }
 
-/// Mutable borrowed `SerializedDb`
-#[derive(Debug)]
+/// Mutable borrowed, pinned `SerializedDb`.
 pub struct SerializedDbMut<'a>(mem::ManuallyDrop<SerializedDb>, PhantomData<&'a mut SerializedDb>);
 impl SerializedDbMut<'_> {
     /// SQLite still owns the database, but there is no place to store `SerializedDb`.
@@ -367,34 +356,44 @@ impl SerializedDbMut<'_> {
         Self(mem::ManuallyDrop::new(serialized), PhantomData)
     }
 }
+impl ResizableBytes for SerializedDbMut<'_> {
+    unsafe fn set_len(&mut self, new_len: usize) {
+        self.0.set_len(new_len);
+    }
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+impl iter::Extend<u8> for SerializedDbMut<'_> {
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        self.0.extend(iter)
+    }
+}
 impl ops::Deref for SerializedDbMut<'_> {
-    type Target = SerializedDb;
-    fn deref(&self) -> &SerializedDb {
-        &self.0
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.0.deref()
     }
 }
 impl ops::DerefMut for SerializedDbMut<'_> {
-    fn deref_mut(&mut self) -> &mut SerializedDb {
-        &mut self.0
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.0.deref_mut()
+    }
+}
+impl fmt::Debug for SerializedDbMut<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
     }
 }
 
 /// Resizable vector of bytes
-pub trait ResizableBytes: ops::Deref<Target=[u8]> + ops::DerefMut + fmt::Debug + 'static {
+pub trait ResizableBytes: ops::Deref<Target=[u8]> + ops::DerefMut + fmt::Debug {
     /// Set length.
     unsafe fn set_len(&mut self, new_len: usize);
     /// Get capacity.
     fn capacity(&self) -> usize;
 }
 impl ResizableBytes for Vec<u8> {
-    unsafe fn set_len(&mut self, new_len: usize) {
-        self.set_len(new_len);
-    }
-    fn capacity(&self) -> usize {
-        self.capacity()
-    }
-}
-impl ResizableBytes for SerializedDb {
     unsafe fn set_len(&mut self, new_len: usize) {
         self.set_len(new_len);
     }
@@ -595,18 +594,18 @@ mod test {
             END;";
         let db1 = Connection::open_in_memory()?;
         db1.execute_batch(sql)?;
-        let serialized1 = db1.serialize(DatabaseName::Main)?.unwrap();
-        let mut db2 = Connection::open_in_memory()?;
-        db2.deserialize(DatabaseName::Main, serialized1)?;
-        let mut serialized2 = db2.serialize_no_copy(DatabaseName::Main)?.unwrap();
-        let initial_len = serialized2.len();
-        let cap = serialized2.capacity();
+        let mut serialized1 = db1.serialize(DatabaseName::Main)?.unwrap();
+        // let mut db2 = Connection::open_in_memory()?;
+        // db2.deserialize(DatabaseName::Main, serialized1)?;
+        // let mut serialized2 = db2.serialize_no_copy(DatabaseName::Main)?.unwrap();
+        let initial_len = serialized1.len();
+        let cap = serialized1.capacity();
         dbg!(initial_len, cap);
-        serialized2.set_capacity(cap + 1024);
+        serialized1.set_capacity(cap + 8192);
 
         // create a new db and mutably borrow the serialized data
         let mut db3 = Connection::open_in_memory()?.into_borrowing();
-        db3.deserialize_mut(DatabaseName::Main, &mut *serialized2)?;
+        db3.deserialize_mut(DatabaseName::Main, &mut serialized1)?;
         // update should not affect length
         db3.execute_batch("UPDATE hello SET x = 44 WHERE x = 3")?;
         let mut query = db3.prepare("SELECT x FROM hello")?;
@@ -616,17 +615,21 @@ mod test {
         assert_eq!(initial_len, serialize_len(&mut db3));
 
         // insert data until the length needs to grow
-        while serialize_len(&mut db3) == initial_len {
-            db3.execute_batch("INSERT INTO hello VALUES(55);")?;
-        }
+        let count_until_resize = std::iter::repeat(()).take_while(|_| {
+            db3.execute_batch("INSERT INTO hello VALUES(44);").unwrap();
+            serialize_len(&mut db3) == initial_len
+        }).count();
+        assert_eq!(524 , count_until_resize);
 
-        // without increasing the capacity, DiskFull is thrown
-        let sql = str::repeat("INSERT INTO hello VALUES(55);", 1400);
-        if let Err(Error::SqliteFailure(ffi::Error { code: ErrorCode::DiskFull, extended_code: _ }, _)) = db3.execute_batch(&sql) {
+        // after some time, DiskFull is thrown
+        let sql = "INSERT INTO hello VALUES(55);";
+        for _i in 0..=509 {
+            db3.execute_batch(sql)?;
+        }
+        if let Err(Error::SqliteFailure(ffi::Error { code: ErrorCode::DiskFull, extended_code: _ }, _)) = db3.execute_batch(sql) {
         } else {
             panic!("should return SqliteFailure");
         }
-
         
         Ok(())
     }
