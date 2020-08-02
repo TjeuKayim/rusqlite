@@ -55,6 +55,8 @@
 //! ```
 #![warn(missing_docs)]
 
+#![cfg_attr(feature = "alloc-wg", feature(allocator_api, alloc_layout_extra))]
+
 pub use libsqlite3_sys as ffi;
 
 use std::cell::RefCell;

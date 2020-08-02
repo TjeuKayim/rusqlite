@@ -39,8 +39,6 @@
 //!
 //! Alternatively, consider using the [Backup API](./backup/).
 
-pub use mem_file::MemFile;
-
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::{fmt, mem, ops, ptr, slice};
@@ -48,6 +46,8 @@ use std::{fmt, mem, ops, ptr, slice};
 use crate::ffi;
 use crate::{inner_connection::InnerConnection, Connection, DatabaseName, Result};
 
+pub use mem_file::MemFile;
+#[cfg_attr(feature = "alloc-wg", path = "mem_file_alloc_wg.rs")]
 mod mem_file;
 
 impl Connection {
@@ -74,7 +74,7 @@ impl Connection {
                 .map(|r| {
                     r.map(|(data, len)| {
                         let cap = ffi::sqlite3_msize(data.as_ptr() as _) as _;
-                        MemFile::from_non_null(data, len, cap)
+                        MemFile::from_raw_parts(data.as_ptr(), len, cap)
                     })
                 })
         }
@@ -232,7 +232,7 @@ impl<'a> BorrowingConnection<'a> {
             let new_data =
                 if let Ok(Some((p, len))) = c.serialize_with_flags(db, SerializeFlags::NO_COPY) {
                     let cap = ffi::sqlite3_msize(p.as_ptr() as _) as _;
-                    MemFile::from_non_null(p, len, cap)
+                    MemFile::from_raw_parts(p.as_ptr(), len, cap)
                 } else {
                     MemFile::new()
                 };
