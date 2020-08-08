@@ -45,7 +45,8 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::os::raw::c_int;
 use std::sync::Mutex;
-use std::{fmt, mem, ops, ptr, slice};
+use std::mem::MaybeUninit;
+use std::{fmt, mem, ops, ptr, slice, panic};
 
 use crate::ffi;
 use crate::{inner_connection::InnerConnection, Connection, DatabaseName, Result};
@@ -153,6 +154,21 @@ impl InnerConnection {
         flags: SerializeFlags,
     ) -> Result<Option<(NonNull<u8>, usize)>> {
         let db = db.to_cstring()?;
+
+        let mut file_option = None;
+        if let Some(hooked) = &HOOKED_IO_METHODS {
+            let mut file = MaybeUninit::uninit();
+            let rc = ffi::sqlite3_file_control(self.db(), db.as_ptr(), ffi::SQLITE_FCNTL_FILE_POINTER, file.as_mut_ptr() as _);
+            if rc == ffi::SQLITE_OK {
+                let file: &mut ffi::sqlite3_file = file.assume_init();
+                if file.pMethods == hooked {
+                    dbg!("temp set hooked back to SQLITE_IO_METHODS");
+                    file.pMethods = SQLITE_IO_METHODS;
+                    file_option = Some(file);
+                }
+            }
+        }
+    
         let mut len = 0;
         let data = ffi::sqlite3_serialize(
             self.db(),
@@ -160,35 +176,10 @@ impl InnerConnection {
             &mut len as *mut _ as *mut _,
             flags.bits() as _,
         );
+        if let Some(file) = file_option {
+            file.pMethods = HOOKED_IO_METHODS.as_ref().unwrap();
+        }
         Ok(NonNull::new(data).map(|d| (d, len)))
-    }
-
-    fn set_close_hook<'a>(&mut self, schema: &DatabaseName, data_ptr: *mut MemFile, on_close: Box<dyn FnOnce() + Send + 'a>) -> Result<()> {
-        static mut MEM_VFS_CLOSE: Option<unsafe extern "C" fn(*mut ffi::sqlite3_file) -> c_int> = None;
-        lazy_static::lazy_static! {
-            static ref FILE_BORROW: Mutex<HashMap<usize, Box<dyn FnOnce() + Send + Sync>>> = Mutex::new(HashMap::new());
-        }
-        static FORK_MEM_VFS: std::sync::Once = std::sync::Once::new();
-        unsafe extern "C" fn close_fork(file: *mut ffi::sqlite3_file) -> c_int {
-            // Ignore PoisonError, because panicing here is UB 
-            let _ = FILE_BORROW.lock().map(|mut l| l.remove(&(file as usize)).map(|f| f()));
-            MEM_VFS_CLOSE.map(|f| f(file)).unwrap_or(ffi::SQLITE_OK)
-        }
-        FORK_MEM_VFS.call_once(|| {
-            let schema = schema.to_cstring().unwrap();
-            let mut file = ptr::null_mut::<ffi::sqlite3_file>();
-            unsafe {
-                let rc = ffi::sqlite3_file_control(self.db(), schema.as_ptr(), ffi::SQLITE_FCNTL_FILE_POINTER, &mut file as *mut _ as _);
-                self.decode_result(rc).unwrap();
-                // most unsafe thing in this module, wring to *const pointer
-                let methods: &mut ffi::sqlite3_io_methods = &mut *((*file).pMethods as *mut ffi::sqlite3_io_methods);
-                println!("pointer {:p} {:p} {:?} {:?}", (*file).pMethods, methods, (*(*file).pMethods).xClose, methods.xClose);
-                MEM_VFS_CLOSE = methods.xClose;
-                methods.xClose = Some(close_fork);
-            }
-        });
-        FILE_BORROW.lock().unwrap().insert(data_ptr as _, unsafe { mem::transmute(on_close) });
-        Ok(())
     }
 }
 
@@ -261,25 +252,73 @@ impl<'a> BorrowingConnection<'a> {
     ) -> Result<()> {
         let data_ptr = data as *mut MemFile;
         let second_data = unsafe { &mut *data_ptr };
-        let second_conn = unsafe { &mut *(&mut self.conn as *mut Connection) };
-        let on_close = Box::new(move || unsafe {
-            let c = second_conn.db.borrow();
-            let new_data =
-                if let Ok(Some((p, len))) = c.serialize_with_flags(db, SerializeFlags::NO_COPY) {
-                    let cap = ffi::sqlite3_msize(p.as_ptr() as _) as _;
-                    MemFile::from_non_null(p, len, cap)
-                } else {
-                    MemFile::new()
-                };
+        let on_close = Box::new(move |file: &mut ffi::sqlite3_file| unsafe {
+            let fetch: *mut u8 = {
+                let mut fetch = MaybeUninit::uninit();
+                let rc = (*file.pMethods).xFetch.unwrap()(file, 0, 0, fetch.as_mut_ptr() as _);
+                debug_assert_eq!(rc, ffi::SQLITE_OK);
+                let rc = (*file.pMethods).xUnfetch.unwrap()(file, 0, ptr::null_mut());
+                debug_assert_eq!(rc, ffi::SQLITE_OK);
+                fetch.assume_init()
+            };
+            let file_size: i64 = {
+                let mut size = MaybeUninit::uninit();
+                let rc = (*file.pMethods).xFileSize.unwrap()(file, size.as_mut_ptr());
+                debug_assert_eq!(rc, ffi::SQLITE_OK);
+                size.assume_init()
+            };
+            let p = NonNull::new(fetch).unwrap();
+            let cap = ffi::sqlite3_msize(p.as_ptr() as _) as _;
+            let new_data = MemFile::from_non_null(p, file_size as _, cap);
+            dbg!(new_data.len());
             ptr::write(second_data as *mut _, new_data);
         });
         let mut c = self.conn.db.borrow_mut();
         unsafe { c.deserialize_with_flags(db, data, data.capacity(), DeserializeFlags::RESIZABLE) }
             .and_then(|r| {
-                c.set_close_hook(&db, data_ptr, on_close)?;
+                set_close_hook(&mut c, &db, on_close)?;
                 Ok(r)
             })
     }
+}
+
+static mut SQLITE_IO_METHODS: *const ffi::sqlite3_io_methods = ptr::null();
+static mut HOOKED_IO_METHODS: Option<ffi::sqlite3_io_methods> = None;
+lazy_static::lazy_static! {
+    static ref FILE_BORROW: Mutex<HashMap<usize, Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + Sync>>> = Mutex::new(HashMap::new());
+}
+
+fn set_close_hook<'a>(c: &mut InnerConnection, schema: &DatabaseName, on_close: Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + 'a>) -> Result<()> {
+    unsafe {
+        let schema = schema.to_cstring().unwrap();
+        let mut file = MaybeUninit::uninit();
+        let rc = ffi::sqlite3_file_control(c.db(), schema.as_ptr(), ffi::SQLITE_FCNTL_FILE_POINTER, file.as_mut_ptr() as _);
+        c.decode_result(rc)?;
+        let file: &mut ffi::sqlite3_file = file.assume_init();
+        // TODO: Research weather this is thread-safe and no data races can occur
+        if SQLITE_IO_METHODS.is_null() {
+            SQLITE_IO_METHODS = file.pMethods;
+        }
+        if HOOKED_IO_METHODS.is_none() {
+            HOOKED_IO_METHODS = Some(ffi::sqlite3_io_methods {
+                xClose: Some(close_fork),
+                ..*SQLITE_IO_METHODS
+            });
+        }
+        file.pMethods = HOOKED_IO_METHODS.as_ref().unwrap();
+        FILE_BORROW.lock().unwrap().insert(file as *const _ as _, mem::transmute(on_close));
+        Ok(())
+    }
+}
+
+unsafe extern "C" fn close_fork(file: *mut ffi::sqlite3_file) -> c_int {
+    panic::catch_unwind(|| {
+        FILE_BORROW.lock().map(|mut l| {
+            debug_assert_eq!((*file).pMethods, HOOKED_IO_METHODS.as_ref().map_or(ptr::null(), |h| h));
+            l.remove(&(file as usize))
+                .map_or(ffi::SQLITE_ERROR, |f| { f(&mut *file); ffi::SQLITE_OK })
+        }).unwrap_or(ffi::SQLITE_ERROR)
+    }).unwrap_or(ffi::SQLITE_ERROR) // TODO: Also provide error message
 }
 
 impl Drop for BorrowingConnection<'_> {
@@ -596,37 +635,37 @@ mod test {
         // serializing again should work
         db1.execute_batch("ATTACH DATABASE ':memory:' AS three;")?;
         let mut db1 = db1.into_borrowing();
-        db1.deserialize_resizable(DatabaseName::Attached("three"), &mut serialized1)?; // FIXME: memory leak
-        // let count: u16 = db1.query_row("SELECT COUNT(*) FROM hello", NO_PARAMS, |r| r.get(0))?;
-        // assert_eq!(3, count);
-        // let count: u16 =
-        //     db1.query_row("SELECT COUNT(*) FROM three.hello", NO_PARAMS, |r| r.get(0))?;
-        // assert_eq!(528, count);
+        db1.deserialize_resizable(DatabaseName::Attached("three"), &mut serialized1)?;
+        let count: u16 = db1.query_row("SELECT COUNT(*) FROM hello", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!(3, count);
+        let count: u16 =
+            db1.query_row("SELECT COUNT(*) FROM three.hello", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!(528, count);
 
         // test detach error handling for deserialize_resizable
-        db1.execute_batch("DETACH DATABASE three")?; // FIXME: memory leak
-        // mem::drop(db1);
-        // assert_eq!(0, serialized1.capacity());
-        // assert_eq!(0, serialized1.len());
-        // assert_eq!(
-        //     std::ptr::NonNull::dangling().as_ptr(),
-        //     serialized1.as_mut_ptr()
-        // );
+        db1.execute_batch("DETACH DATABASE three")?;
+        mem::drop(db1);
+        assert_eq!(0, serialized1.capacity());
+        assert_eq!(0, serialized1.len());
+        assert_eq!(
+            std::ptr::NonNull::dangling().as_ptr(),
+            serialized1.as_mut_ptr()
+        );
 
-        // // test detach error handling for deserialize_mut
-        // assert_ne!(0, serialized2.capacity());
-        // assert_ne!(0, serialized2.len());
-        // let mut db4 = Connection::open_in_memory()?.into_borrowing();
-        // db4.execute_batch("ATTACH DATABASE ':memory:' AS hello")?;
-        // db4.deserialize_mut(DatabaseName::Attached("hello"), &mut serialized2)?;
-        // db4.execute_batch("DETACH DATABASE hello")?;
-        // let debug = format!("{:?}", db4);
-        // mem::drop(db4);
-        // assert_ne!(0, serialized2.capacity());
-        // assert_eq!(0, serialized2.len());
+        // test detach error handling for deserialize_mut
+        assert_ne!(0, serialized2.capacity());
+        assert_ne!(0, serialized2.len());
+        let mut db4 = Connection::open_in_memory()?.into_borrowing();
+        db4.execute_batch("ATTACH DATABASE ':memory:' AS hello")?;
+        db4.deserialize_mut(DatabaseName::Attached("hello"), &mut serialized2)?;
+        db4.execute_batch("DETACH DATABASE hello")?;
+        let debug = format!("{:?}", db4);
+        mem::drop(db4);
+        assert_ne!(0, serialized2.capacity());
+        assert_eq!(0, serialized2.len());
 
-        // // Debug impl
-        // assert_eq!(&debug, "BorrowingConnection { conn: Connection { path: Some(\":memory:\") }, slice_drop: [Attached(\"hello\")] }");
+        // Debug impl
+        assert_eq!(&debug, "BorrowingConnection { conn: Connection { path: Some(\":memory:\") }, slice_drop: [Attached(\"hello\")] }");
 
         Ok(())
     }
