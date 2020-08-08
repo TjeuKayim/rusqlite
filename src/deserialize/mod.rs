@@ -42,12 +42,12 @@
 pub use mem_file::MemFile;
 
 use std::collections::HashMap;
-use std::ptr::NonNull;
-use std::os::raw::c_int;
-use std::sync::Mutex;
-use std::mem::MaybeUninit;
 use std::marker::PhantomData;
-use std::{fmt, mem, ops, ptr, slice, panic};
+use std::mem::MaybeUninit;
+use std::os::raw::c_int;
+use std::ptr::NonNull;
+use std::sync::Mutex;
+use std::{fmt, mem, ops, panic, ptr, slice};
 
 use crate::ffi;
 use crate::{inner_connection::InnerConnection, Connection, DatabaseName, Result};
@@ -159,7 +159,12 @@ impl InnerConnection {
         let mut file_option = None;
         if let Some(hooked) = &HOOKED_IO_METHODS {
             let mut file = MaybeUninit::uninit();
-            let rc = ffi::sqlite3_file_control(self.db(), db.as_ptr(), ffi::SQLITE_FCNTL_FILE_POINTER, file.as_mut_ptr() as _);
+            let rc = ffi::sqlite3_file_control(
+                self.db(),
+                db.as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                file.as_mut_ptr() as _,
+            );
             if rc == ffi::SQLITE_OK {
                 let file: &mut ffi::sqlite3_file = file.assume_init();
                 if file.pMethods == hooked {
@@ -168,7 +173,7 @@ impl InnerConnection {
                 }
             }
         }
-    
+
         let mut len = 0;
         let data = ffi::sqlite3_serialize(
             self.db(),
@@ -285,11 +290,20 @@ lazy_static::lazy_static! {
     static ref FILE_BORROW: Mutex<HashMap<usize, Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + Sync>>> = Mutex::new(HashMap::new());
 }
 
-fn set_close_hook<'a>(c: &mut InnerConnection, schema: &DatabaseName, on_close: Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + 'a>) -> Result<()> {
+fn set_close_hook<'a>(
+    c: &mut InnerConnection,
+    schema: &DatabaseName,
+    on_close: Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + 'a>,
+) -> Result<()> {
     unsafe {
         let schema = schema.to_cstring().unwrap();
         let mut file = MaybeUninit::uninit();
-        let rc = ffi::sqlite3_file_control(c.db(), schema.as_ptr(), ffi::SQLITE_FCNTL_FILE_POINTER, file.as_mut_ptr() as _);
+        let rc = ffi::sqlite3_file_control(
+            c.db(),
+            schema.as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            file.as_mut_ptr() as _,
+        );
         c.decode_result(rc)?;
         let file: &mut ffi::sqlite3_file = file.assume_init();
         // TODO: Research weather this is thread-safe and no data races can occur
@@ -303,19 +317,31 @@ fn set_close_hook<'a>(c: &mut InnerConnection, schema: &DatabaseName, on_close: 
             });
         }
         file.pMethods = HOOKED_IO_METHODS.as_ref().unwrap();
-        FILE_BORROW.lock().unwrap().insert(file as *const _ as _, mem::transmute(on_close));
+        FILE_BORROW
+            .lock()
+            .unwrap()
+            .insert(file as *const _ as _, mem::transmute(on_close));
         Ok(())
     }
 }
 
 unsafe extern "C" fn close_fork(file: *mut ffi::sqlite3_file) -> c_int {
     panic::catch_unwind(|| {
-        FILE_BORROW.lock().map(|mut l| {
-            debug_assert_eq!((*file).pMethods, HOOKED_IO_METHODS.as_ref().map_or(ptr::null(), |h| h));
-            l.remove(&(file as usize))
-                .map_or(ffi::SQLITE_ERROR, |f| { f(&mut *file); ffi::SQLITE_OK })
-        }).unwrap_or(ffi::SQLITE_ERROR)
-    }).unwrap_or_else(|_e| {
+        FILE_BORROW
+            .lock()
+            .map(|mut l| {
+                debug_assert_eq!(
+                    (*file).pMethods,
+                    HOOKED_IO_METHODS.as_ref().map_or(ptr::null(), |h| h)
+                );
+                l.remove(&(file as usize)).map_or(ffi::SQLITE_ERROR, |f| {
+                    f(&mut *file);
+                    ffi::SQLITE_OK
+                })
+            })
+            .unwrap_or(ffi::SQLITE_ERROR)
+    })
+    .unwrap_or_else(|_e| {
         // TODO: Provide error message to app
         ffi::SQLITE_ERROR
     })
@@ -652,7 +678,10 @@ mod test {
         assert!(serialized1[..] == serialized2[..]);
 
         // Debug impl
-        assert_eq!(&debug, "BorrowingConnection { conn: Connection { path: Some(\":memory:\") } }");
+        assert_eq!(
+            &debug,
+            "BorrowingConnection { conn: Connection { path: Some(\":memory:\") } }"
+        );
 
         Ok(())
     }
