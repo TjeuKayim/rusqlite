@@ -238,9 +238,9 @@ impl<'a> BorrowingConnection<'a> {
         });
         let mut c = self.conn.db.borrow_mut();
         unsafe { c.deserialize_with_flags(db, data, data.capacity(), DeserializeFlags::empty()) }
-            .and_then(|r| {
+            .and_then(|_| {
                 set_close_hook(&mut c, &db, on_close)?;
-                Ok(r)
+                Ok(())
             })
     }
 
@@ -277,17 +277,18 @@ impl<'a> BorrowingConnection<'a> {
         });
         let mut c = self.conn.db.borrow_mut();
         unsafe { c.deserialize_with_flags(db, data, data.capacity(), DeserializeFlags::RESIZABLE) }
-            .and_then(|r| {
+            .and_then(|_| {
                 set_close_hook(&mut c, &db, on_close)?;
-                Ok(r)
+                Ok(())
             })
     }
 }
 
 static mut SQLITE_IO_METHODS: *const ffi::sqlite3_io_methods = ptr::null();
 static mut HOOKED_IO_METHODS: Option<ffi::sqlite3_io_methods> = None;
+type OnClose = Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + Sync>;
 lazy_static::lazy_static! {
-    static ref FILE_BORROW: Mutex<HashMap<usize, Box<dyn FnOnce(&mut ffi::sqlite3_file) + Send + Sync>>> = Mutex::new(HashMap::new());
+    static ref FILE_BORROW: Mutex<HashMap<usize, OnClose>> = Mutex::new(HashMap::new());
 }
 
 fn set_close_hook<'a>(
