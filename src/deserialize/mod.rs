@@ -242,6 +242,7 @@ impl<'a> BorrowingConnection<'a> {
         schema: DatabaseName<'a>,
         data: &'a mut MemFile,
     ) -> Result<()> {
+        let second_conn = unsafe { &mut *(&mut self.conn as *mut Connection) };
         let mut c = self.conn.db.borrow_mut();
         unsafe {
             c.deserialize_with_flags(schema, data, data.capacity(), DeserializeFlags::RESIZABLE)
@@ -251,21 +252,15 @@ impl<'a> BorrowingConnection<'a> {
                 &mut c,
                 &schema,
                 Box::new(move |file: &mut ffi::sqlite3_file| unsafe {
-                    let fetch: *mut u8 = {
-                        // Unfortunately, serialize_no_copy does not work here as the db is already
-                        // detached, but the sqlite3_file is not yet freed. Because the aData field
-                        // is private, this hack is needed to get the buffer.
-                        let mut fetch = MaybeUninit::zeroed();
-                        let rc =
-                            (*file.pMethods).xFetch.unwrap()(file, 0, 0, fetch.as_mut_ptr() as _);
-                        debug_assert_eq!(rc, ffi::SQLITE_OK);
-                        let rc = (*file.pMethods).xUnfetch.unwrap()(file, 0, ptr::null_mut());
-                        debug_assert_eq!(rc, ffi::SQLITE_OK);
-                        fetch.assume_init()
+                    let c = second_conn.db.borrow();
+                    let new_data = if let Ok(Some((p, len))) =
+                        c.serialize_with_flags(schema, SerializeFlags::NO_COPY)
+                    {
+                        let cap = ffi::sqlite3_msize(p.as_ptr() as _) as _;
+                        MemFile::from_non_null(p, len, cap)
+                    } else {
+                        MemFile::new()
                     };
-                    let p = NonNull::new(fetch).unwrap();
-                    let cap = ffi::sqlite3_msize(p.as_ptr() as _) as _;
-                    let new_data = MemFile::from_non_null(p, get_file_len(file), cap);
                     ptr::write(data as *mut _, new_data);
                 }),
             )?;
