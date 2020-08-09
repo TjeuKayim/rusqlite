@@ -44,7 +44,7 @@ pub use mem_file::MemFile;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_void};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::{fmt, mem, ops, panic, ptr, slice};
@@ -223,7 +223,7 @@ impl<'a> BorrowingConnection<'a> {
             c.deserialize_with_flags(schema, data, data.capacity(), DeserializeFlags::empty())
         }
         .and_then(|_| {
-            set_close_hook(
+            set_realloc_hook(
                 &mut c,
                 &schema,
                 Box::new(move |file: &mut ffi::sqlite3_file| unsafe {
@@ -247,7 +247,7 @@ impl<'a> BorrowingConnection<'a> {
             c.deserialize_with_flags(schema, data, data.capacity(), DeserializeFlags::RESIZABLE)
         }
         .and_then(|_| {
-            set_close_hook(
+            set_realloc_hook(
                 &mut c,
                 &schema,
                 Box::new(move |file: &mut ffi::sqlite3_file| unsafe {
@@ -276,15 +276,15 @@ impl<'a> BorrowingConnection<'a> {
 
 static mut SQLITE_IO_METHODS: *const ffi::sqlite3_io_methods = ptr::null();
 static mut HOOKED_IO_METHODS: Option<ffi::sqlite3_io_methods> = None;
-type OnClose = Box<dyn FnMut(&mut ffi::sqlite3_file) + Send + Sync>;
+type OnWrite = Box<dyn FnMut(&mut ffi::sqlite3_file) + Send + Sync>;
 lazy_static::lazy_static! {
-    static ref FILE_BORROW: Mutex<HashMap<usize, OnClose>> = Mutex::new(HashMap::new());
+    static ref FILE_BORROW: Mutex<HashMap<usize, OnWrite>> = Mutex::new(HashMap::new());
 }
 
-fn set_close_hook<'a>(
+fn set_realloc_hook<'a>(
     c: &mut InnerConnection,
     schema: &DatabaseName,
-    on_close: Box<dyn FnMut(&mut ffi::sqlite3_file) + Send + 'a>,
+    on_write: Box<dyn FnMut(&mut ffi::sqlite3_file) + Send + 'a>,
 ) -> Result<()> {
     unsafe {
         let schema = schema.to_cstring().unwrap();
@@ -297,6 +297,8 @@ fn set_close_hook<'a>(
         }
         if HOOKED_IO_METHODS.is_none() {
             HOOKED_IO_METHODS = Some(ffi::sqlite3_io_methods {
+                // realloc is only called in memdbEnlarge and memdbWrite
+                xWrite: Some(write_fork),
                 xClose: Some(close_fork),
                 ..*SQLITE_IO_METHODS
             });
@@ -309,26 +311,31 @@ fn set_close_hook<'a>(
         FILE_BORROW
             .lock()
             .unwrap()
-            .insert(file as *const _ as _, mem::transmute(on_close));
+            .insert(file as *const _ as _, mem::transmute(on_write));
         Ok(())
     }
 }
 
-unsafe extern "C" fn close_fork(file: *mut ffi::sqlite3_file) -> c_int {
+unsafe extern "C" fn write_fork(
+    file: *mut ffi::sqlite3_file,
+    z: *const c_void,
+    amt: c_int,
+    ofst: i64,
+) -> c_int {
     // This function is called by C, so panicing would be UB.
     panic::catch_unwind(|| {
+        debug_assert_eq!(
+            (*file).pMethods,
+            HOOKED_IO_METHODS.as_ref().map_or(ptr::null(), |h| h)
+        );
+        let rc = (*SQLITE_IO_METHODS).xWrite.unwrap()(file, z, amt, ofst);
         FILE_BORROW
             .lock()
             .map(|mut l| {
-                debug_assert_eq!(
-                    (*file).pMethods,
-                    HOOKED_IO_METHODS.as_ref().map_or(ptr::null(), |h| h)
-                );
-                l.remove(&(file as usize))
-                    .map_or(ffi::SQLITE_ERROR, |mut f| {
-                        f(&mut *file);
-                        ffi::SQLITE_OK
-                    })
+                l.get_mut(&(file as usize)).map_or(ffi::SQLITE_ERROR, |f| {
+                    f(&mut *file);
+                    rc
+                })
             })
             .unwrap_or(ffi::SQLITE_ERROR)
     })
@@ -336,6 +343,16 @@ unsafe extern "C" fn close_fork(file: *mut ffi::sqlite3_file) -> c_int {
         // TODO: Don't discard the error message
         ffi::SQLITE_ERROR
     })
+}
+
+unsafe extern "C" fn close_fork(file: *mut ffi::sqlite3_file) -> c_int {
+    FILE_BORROW
+        .lock()
+        .map(|mut l| {
+            l.remove(&(file as usize));
+            ffi::SQLITE_OK
+        })
+        .unwrap_or(ffi::SQLITE_ERROR)
 }
 
 fn get_file_len(file: &mut ffi::sqlite3_file) -> usize {
