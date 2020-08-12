@@ -301,7 +301,6 @@ pub enum DatabaseName<'a> {
     feature = "backup",
     feature = "blob",
     feature = "session",
-    feature = "deserialize",
     feature = "modern_sqlite"
 ))]
 impl DatabaseName<'_> {

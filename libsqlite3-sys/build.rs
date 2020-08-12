@@ -128,7 +128,8 @@ mod build_bundled {
             cfg.flag("-DSQLITE_ENABLE_SESSION");
         }
         if cfg!(feature = "deserialize") {
-            cfg.flag("-DSQLITE_ENABLE_DESERIALIZE");
+            cfg.flag("-DSQLITE_ENABLE_DESERIALIZE")
+                .flag("-DSQLITE_ENABLE_DBPAGE_VTAB");
         }
 
         if let Ok(limit) = env::var("SQLITE_MAX_VARIABLE_NUMBER") {

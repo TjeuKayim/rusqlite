@@ -38,12 +38,12 @@
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
-use std::ptr::NonNull;
-use std::{convert::TryInto, fmt, mem, ops, panic, ptr, rc::Rc};
+use std::{borrow::Cow, convert::TryInto, fmt, io, mem, ops, panic, ptr, rc::Rc};
 
 use crate::ffi;
 use crate::{
-    inner_connection::InnerConnection, util::SmallCString, Connection, DatabaseName, Result,
+    error, inner_connection::InnerConnection, util::SmallCString, Connection, DatabaseName, Result,
+    NO_PARAMS,
 };
 use mem_file::MemFile;
 
@@ -61,27 +61,84 @@ impl Connection {
     /// Return the serialization of a database, or `None` when [`DatabaseName`] does not exist.
     /// See the C Interface Specification [Serialize a database](https://www.sqlite.org/c3ref/serialize.html).
     pub fn serialize(&self, schema: DatabaseName<'_>) -> Result<Option<Vec<u8>>> {
-        unsafe {
-            let c = self.db.borrow();
-            let schema = schema.to_cstring()?;
-            let mut len = 0;
-            let data =
-                ffi::sqlite3_serialize(c.db(), schema.as_ptr(), &mut len as *mut _ as *mut _, 0);
-            Ok(NonNull::new(data).map(|data| {
-                let cap = ffi::sqlite3_msize(data.as_ptr() as _) as _;
-                // TODO: Optimize copy with hooked_io_methods and remove MemFile
-                let file = MemFile::from_non_null(data, len, cap);
-                let mut vec = Vec::new();
-                vec.extend_from_slice(&file);
-                vec
-            }))
-        }
+        let schema = schema.to_cstring()?;
+        let c = self.db.borrow();
+        let file = file_ptr(&c, &schema);
+        mem::drop(c);
+        file.map(|file| unsafe {
+            if file.pMethods == hooked_io_methods() {
+                let hooked = &mut *(file as *mut _ as *mut HookedFile);
+                return Ok(hooked.as_ref().as_slice().to_vec());
+            }
+            // pragma_query_value is not used because the PRAGMA function should be preferred.
+            // escape_double_quote is only available with feature vtab.
+            let schema_str = schema.as_str();
+            let escaped = if schema_str.contains('\'') {
+                Cow::Owned(schema_str.replace("'", "''"))
+            } else {
+                Cow::Borrowed(schema_str)
+            };
+            let sql = &format!(
+                "SELECT * FROM '{}'.pragma_page_size JOIN pragma_page_count",
+                escaped
+            );
+            let (page_size, page_count): (i64, i64) =
+                self.query_row(sql, NO_PARAMS, |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let total_size = (page_size * page_count).try_into().unwrap();
+            let mut vec = Vec::with_capacity(total_size);
+            // sqlite3PagerGet and sqlite3PagerGetData are private APIs,
+            // so the SQLITE_DBPAGE Virtual Table is used instead.
+            dbg!(&escaped);
+            let temp_db_name = "rusqlite_internal_deserialize";
+            let sql = &format!(
+                "ATTACH ':memory:' AS {db};
+                CREATE TABLE {db}.page(pgno INTEGER PRIMARY KEY,data BLOB);
+                INSERT INTO {db}.page SELECT * FROM sqlite_dbpage('{}');",
+                escaped,
+                db = temp_db_name
+            );
+            self.execute_batch(sql)?;
+            let _detach = DetachGuard(self, temp_db_name);
+            // let sql = "SELECT (SELECT length(data) FROM {db}.page LIMIT 1), (SELECT COUNT(*) FROM {db}.page)";
+            // let (x_page_size, x_page_count): (i64, i64) = stmt.query_row(NO_PARAMS, |r| Ok((r.get(0)?, r.get(1)?)))?;
+            // dbg!(page_size, x_page_size, page_count, x_page_count);
+            let mut blob = self.blob_open(
+                DatabaseName::Attached(temp_db_name),
+                "page",
+                "data",
+                1,
+                true,
+            )?;
+            for row_id in 1..=page_count {
+                if row_id > 1 {
+                    blob.reopen(row_id)?
+                }
+                io::copy(&mut blob, &mut vec).map_err(|e| {
+                    e.into_inner()
+                        .and_then(|e| e.downcast::<error::Error>().map(|b| *b).ok())
+                        .unwrap_or_else(|| {
+                            debug_assert!(false, "Blob reader should return error::Error");
+                            error::error_from_sqlite_code(ffi::SQLITE_ERROR, None)
+                        })
+                })?;
+            }
+            Ok(vec)
+        })
+        .transpose()
     }
 
     /// Wraps the `Connection` in `BorrowingConnection` to connect it to borrowed serialized memory
     /// using [`BorrowingConnection::deserialize_read_only`].
     pub fn into_borrowing(self) -> BorrowingConnection<'static> {
         BorrowingConnection::new(self)
+    }
+}
+
+struct DetachGuard<'a>(&'a Connection, &'a str);
+
+impl Drop for DetachGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.execute_batch(&format!("DETACH DATABASE {}", self.1));
     }
 }
 
@@ -677,7 +734,7 @@ mod test {
     use crate::{Connection, DatabaseName, Error, ErrorCode, Result, NO_PARAMS};
 
     #[test]
-    pub fn test_serialize() {
+    pub fn test_serialize1() {
         let db = Connection::open_in_memory().unwrap().into_borrowing();
         let sql = "BEGIN;
             CREATE TABLE foo(x INTEGER);
