@@ -70,6 +70,8 @@ impl Connection {
                 let hooked = &mut *(file as *mut _ as *mut HookedFile);
                 return Ok(hooked.as_ref().as_slice().to_vec());
             }
+            // TODO: Optimize sqlite_io_methods
+
             // pragma_query_value is not used because the PRAGMA function should be preferred.
             // escape_double_quote is only available with feature vtab.
             let schema_str = schema.as_str();
@@ -88,6 +90,7 @@ impl Connection {
             let mut vec = Vec::with_capacity(total_size);
             // sqlite3PagerGet and sqlite3PagerGetData are private APIs,
             // so the SQLITE_DBPAGE Virtual Table is used instead.
+            // To open the blobs, the virtual table is copied to a temporarily db.
             dbg!(&escaped);
             let temp_db_name = "rusqlite_internal_deserialize";
             let sql = &format!(
@@ -99,9 +102,6 @@ impl Connection {
             );
             self.execute_batch(sql)?;
             let _detach = DetachGuard(self, temp_db_name);
-            // let sql = "SELECT (SELECT length(data) FROM {db}.page LIMIT 1), (SELECT COUNT(*) FROM {db}.page)";
-            // let (x_page_size, x_page_count): (i64, i64) = stmt.query_row(NO_PARAMS, |r| Ok((r.get(0)?, r.get(1)?)))?;
-            // dbg!(page_size, x_page_size, page_count, x_page_count);
             let mut blob = self.blob_open(
                 DatabaseName::Attached(temp_db_name),
                 "page",
@@ -734,7 +734,7 @@ mod test {
     use crate::{Connection, DatabaseName, Error, ErrorCode, Result, NO_PARAMS};
 
     #[test]
-    pub fn test_serialize1() {
+    pub fn test_serialize_deserialize() {
         let db = Connection::open_in_memory().unwrap().into_borrowing();
         let sql = "BEGIN;
             CREATE TABLE foo(x INTEGER);
