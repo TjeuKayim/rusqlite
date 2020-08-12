@@ -38,14 +38,14 @@
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
-use std::ptr::NonNull;
-use std::{convert::TryInto, fmt, mem, ops, panic, ptr, rc::Rc};
+use std::{convert::TryInto, fmt, mem, ops, panic, ptr, rc::Rc, borrow::Cow};
 
 use crate::ffi;
 use crate::{
-    inner_connection::InnerConnection, util::SmallCString, Connection, DatabaseName, Result,
+    inner_connection::InnerConnection, util::SmallCString, Connection, DatabaseName, Result, NO_PARAMS,
 };
 use mem_file::MemFile;
+use ptr::NonNull;
 
 mod mem_file;
 
@@ -61,21 +61,63 @@ impl Connection {
     /// Return the serialization of a database, or `None` when [`DatabaseName`] does not exist.
     /// See the C Interface Specification [Serialize a database](https://www.sqlite.org/c3ref/serialize.html).
     pub fn serialize(&self, schema: DatabaseName<'_>) -> Result<Option<Vec<u8>>> {
-        unsafe {
-            let c = self.db.borrow();
-            let schema = schema.to_cstring()?;
-            let mut len = 0;
-            let data =
-                ffi::sqlite3_serialize(c.db(), schema.as_ptr(), &mut len as *mut _ as *mut _, 0);
-            Ok(NonNull::new(data).map(|data| {
-                let cap = ffi::sqlite3_msize(data.as_ptr() as _) as _;
-                // TODO: Optimize copy with hooked_io_methods and remove MemFile
-                let file = MemFile::from_non_null(data, len, cap);
-                let mut vec = Vec::new();
-                vec.extend_from_slice(&file);
-                vec
-            }))
-        }
+        let schema = schema.to_cstring()?;
+        let c = self.db.borrow();
+        let file = file_ptr(&c, &schema);
+        mem::drop(c);
+        file.map(|file| unsafe {
+            if file.pMethods == hooked_io_methods() {
+                let hooked = &mut *(file as *mut _ as *mut HookedFile);
+                return Ok(hooked.as_ref().as_slice().to_vec());
+            }
+            // TODO: Optimize sqlite_io_methods
+
+            // pragma_query_value is not used because the PRAGMA function should be preferred.
+            // escape_double_quote is only available with feature vtab.
+            let schema_str = schema.as_str();
+            let escaped = if schema_str.contains('\'') {
+                Cow::Owned(schema_str.replace("'", "''"))
+            } else {
+                Cow::Borrowed(schema_str)
+            };
+            let sql = &format!(
+                "SELECT * FROM '{}'.pragma_page_size JOIN pragma_page_count",
+                escaped
+            );
+            let (page_size, page_count): (i64, i64) =
+                self.query_row(sql, NO_PARAMS, |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let total_size = (page_size * page_count).try_into().unwrap();
+            let mut vec = Vec::with_capacity(total_size);
+            // Unfortunately, sqlite3PagerGet and sqlite3PagerGetData are private APIs
+            let temp_db_name = "rusqlite_internal_deserialize";
+            let temp_db_uri = &format!("file:{}?vfs=memdb&cache=shared", temp_db_name);
+            self.execute_batch(&format!("ATTACH DATABASE '{}' AS {}", temp_db_uri, temp_db_name))?;
+            let temp_file = file_ptr(&self.db.borrow(), &SmallCString::new(temp_db_name)?).unwrap();
+            assert_eq!(temp_file.pMethods, sqlite_io_methods());
+            // At this point, MemFile->aData is null
+            let hooked = HookedFile {
+                methods: hooked_io_methods(),
+                data: Rc::new(FileType::Resizable(&mut vec)),
+                memory_mapped: 0,
+                size_max: total_size * 2,
+            };
+            let file = file as *mut _ as _;
+            ptr::write(file, hooked);
+
+            let sql = &format!(
+                "VACUUM '{escaped}' INTO '{uri}';DETACH DATABASE {name};",
+                escaped=escaped,
+                name=temp_db_name,
+                uri=temp_db_uri
+            );
+            dbg!("vacuum now");
+            self.execute_batch(sql)?;
+            assert_ne!(dbg!(vec.len()), 0);
+
+            // TODO: hook and fill vec
+            Ok(vec)
+        })
+        .transpose()
     }
 
     /// Wraps the `Connection` in `BorrowingConnection` to connect it to borrowed serialized memory
@@ -125,14 +167,7 @@ impl InnerConnection {
             self.deserialize_with_flags(schema, data.as_slice(), data.cap(), 0)?;
             let file = file_ptr(self, &schema).unwrap();
             assert_eq!(file.pMethods, sqlite_io_methods());
-            let mut size_max: ffi::sqlite3_int64 = -1;
-            let rc = (*file.pMethods).xFileControl.unwrap()(
-                file,
-                ffi::SQLITE_FCNTL_SIZE_LIMIT,
-                &mut size_max as *mut _ as _,
-            );
-            assert_eq!(rc, ffi::SQLITE_OK);
-            let size_max = size_max.try_into().unwrap();
+            let size_max = file_size_max(file);
             let hooked = HookedFile {
                 methods: hooked_io_methods(),
                 data: Rc::new(data),
@@ -422,10 +457,46 @@ fn file_ptr<'a>(c: &InnerConnection, schema: &SmallCString) -> Option<&'a mut ff
     }
 }
 
+fn file_size_max(file: &mut ffi::sqlite3_file) -> usize {
+    let mut size_max: ffi::sqlite3_int64 = -1;
+    let rc = unsafe { (*file.pMethods).xFileControl.unwrap()(
+        file,
+        ffi::SQLITE_FCNTL_SIZE_LIMIT,
+        &mut size_max as *mut _ as _,
+    )};
+    assert_eq!(rc, ffi::SQLITE_OK);
+    size_max.try_into().unwrap()
+}
+
+fn file_length(file: &mut ffi::sqlite3_file) -> usize {
+    unsafe {
+        let mut size: i64 = 0;
+        let rc = (*file.pMethods).xFileSize.map(|c| c(file, &mut size));
+        debug_assert_eq!(rc, Some(ffi::SQLITE_OK));
+        size as _
+    }
+}
+
+fn file_buffer(file: &mut ffi::sqlite3_file) -> NonNull<u8> {
+    let fetch: *mut u8 = unsafe {
+        // Unfortunately, serialize_no_copy does not work here as the db is already
+        // detached, but the sqlite3_file is not yet freed. Because the aData field
+        // is private, this hack is needed to get the buffer.
+        let mut fetch = MaybeUninit::zeroed();
+        let rc = (*file.pMethods).xFetch.unwrap()(file, 0, 0, fetch.as_mut_ptr() as _);
+        debug_assert_eq!(rc, ffi::SQLITE_OK);
+        let rc = (*file.pMethods).xUnfetch.unwrap()(file, 0, ptr::null_mut());
+        debug_assert_eq!(rc, ffi::SQLITE_OK);
+        fetch.assume_init()
+    };
+    NonNull::new(fetch).unwrap()
+}
+
 /// This will be called when dropping the `Connection` or
 /// when the database gets detached.
 unsafe extern "C" fn c_close(file: *mut ffi::sqlite3_file) -> c_int {
     panic::catch_unwind(|| {
+        dbg!("c_close");
         // This ptr::read is used so that the HookedFile is dropped at the end of scope.
         ptr::drop_in_place(file as *mut HookedFile);
         ffi::SQLITE_OK
@@ -470,6 +541,7 @@ unsafe extern "C" fn c_write(
     amt: c_int,
     ofst: i64,
 ) -> c_int {
+    dbg!("c_write");
     panic::catch_unwind(|| {
         let file = &mut *(file as *mut HookedFile);
         let data = if let Some(d) = Rc::get_mut(&mut file.data) {
@@ -677,7 +749,7 @@ mod test {
     use crate::{Connection, DatabaseName, Error, ErrorCode, Result, NO_PARAMS};
 
     #[test]
-    pub fn test_serialize() {
+    pub fn test_serialize_deserialize() {
         let db = Connection::open_in_memory().unwrap().into_borrowing();
         let sql = "BEGIN;
             CREATE TABLE foo(x INTEGER);
