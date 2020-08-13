@@ -567,41 +567,31 @@ unsafe extern "C" fn c_device_characteristics(_file: *mut ffi::sqlite3_file) -> 
         | ffi::SQLITE_IOCAP_SEQUENTIAL
 }
 /// Fetch a page of a memory-mapped file.
+#[cfg_attr(feature = "no-panic", no_panic::no_panic)]
 unsafe extern "C" fn c_fetch(
     file: *mut ffi::sqlite3_file,
     ofst: i64,
     amt: c_int,
     p: *mut *mut c_void,
 ) -> c_int {
-    panic::catch_unwind(|| {
-        let file = &mut *(file as *mut HookedFile);
-        let data = file.as_ref();
-        if ofst + amt as i64 > data.len() as _ {
-            *p = ptr::null_mut();
-        } else {
-            // Safety: SQLite uses a read-only memory map <https://www.sqlite.org/mmap.html>,
-            // so it is safe to cast this *const to *mut.
-            *p = data.as_ptr() as *mut u8 as _;
-            file.memory_mapped += 1;
-        }
-        ffi::SQLITE_OK
-    })
-    .unwrap_or_else(|e| {
-        dbg!(e);
-        ffi::SQLITE_ERROR
-    })
+    let file = &mut *(file as *mut HookedFile);
+    let data = file.as_ref();
+    if ofst + amt as i64 > data.len() as _ {
+        *p = ptr::null_mut();
+    } else {
+        // Safety: SQLite uses a read-only memory map <https://www.sqlite.org/mmap.html>,
+        // so it is safe to cast this *const to *mut.
+        *p = data.as_ptr() as *mut u8 as _;
+        file.memory_mapped += 1;
+    }
+    ffi::SQLITE_OK
 }
 /// Release a memory-mapped page.
+#[cfg_attr(feature = "no-panic", no_panic::no_panic)]
 unsafe extern "C" fn c_unfetch(file: *mut ffi::sqlite3_file, _ofst: i64, _p: *mut c_void) -> c_int {
-    panic::catch_unwind(|| {
-        let file = &mut *(file as *mut HookedFile);
-        file.memory_mapped -= 1;
-        ffi::SQLITE_OK
-    })
-    .unwrap_or_else(|e| {
-        dbg!(e);
-        ffi::SQLITE_ERROR
-    })
+    let file = &mut *(file as *mut HookedFile);
+    file.memory_mapped -= 1;
+    ffi::SQLITE_OK
 }
 
 #[cfg(test)]
@@ -919,5 +909,19 @@ mod test {
             .unwrap()
             .unwrap()
             .len()
+    }
+
+    #[test]
+    fn test_fetch() {
+        let mut file = HookedFile {
+            memory_mapped: 0,
+            data: Rc::new(MemFile::ReadOnly(&[])),
+            methods: hooked_io_methods(),
+            size_max: 0,
+        };
+        unsafe { c_fetch(&mut file as *mut _ as _, 0, 0, ptr::null_mut()) };
+        assert_eq!(file.memory_mapped, 1);
+        unsafe { c_unfetch(&mut file as *mut _ as _, 0, ptr::null_mut()) };
+        assert_eq!(file.memory_mapped, 0);
     }
 }
