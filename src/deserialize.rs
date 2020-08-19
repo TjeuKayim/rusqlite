@@ -36,7 +36,7 @@ use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_void};
 use std::{borrow::Cow, convert::TryInto, fmt, mem, ops, panic, ptr, rc::Rc};
 
-use crate::inner_connection::InnerConnection;
+use crate::inner_connection::{InnerConnection, Panics};
 use crate::util::SmallCString;
 use crate::{error, ffi, Connection, DatabaseName, OpenFlags, Result, NO_PARAMS};
 
@@ -182,7 +182,7 @@ impl Connection {
             assert_eq!(rc, ffi::SQLITE_OK);
             let size_max = size_max.try_into().unwrap();
             let file = file as *mut _ as _;
-            ptr::write(file, VecDbFile::new(data, size_max));
+            ptr::write(file, VecDbFile::new(data, size_max, &mut c));
             Ok(())
         }
     }
@@ -196,7 +196,7 @@ fn backup_to_vec(vec: &mut Vec<u8>, src: &Connection, db_name: DatabaseName<'_>)
         // At this point, MemFile->aData is null
         ptr::write(
             temp_file as *mut _ as _,
-            VecDbFile::new(MemFile::Writable(vec), 0),
+            VecDbFile::new(MemFile::Writable(vec), 0, &mut src.db.borrow_mut()),
         );
     };
 
@@ -302,6 +302,10 @@ impl<'a> BorrowingConnection<'a> {
     pub fn deserialize_writable(&self, db: DatabaseName, vec: &'a mut Vec<u8>) -> Result<()> {
         self.deserialize_vec_db(db, MemFile::Writable(vec))
     }
+
+    fn unwrap(self) -> Connection {
+        self.conn
+    }
 }
 
 impl ops::Deref for BorrowingConnection<'_> {
@@ -375,16 +379,18 @@ struct VecDbFile<'a> {
     size_max: usize,
     memory_mapped: u16,
     lock: u8,
+    panics: &'a mut Panics,
 }
 
 impl<'a> VecDbFile<'a> {
-    fn new(data: MemFile<'a>, size_max: usize) -> Self {
+    fn new(data: MemFile<'a>, size_max: usize, conn: &mut InnerConnection) -> Self {
         VecDbFile {
             methods: &VEC_DB_IO_METHODS,
             data: Rc::new(data),
             size_max,
             memory_mapped: 0,
             lock: 0,
+            panics: unsafe { &mut *(conn.panics.as_mut() as *mut _) },
         }
     }
 
@@ -396,6 +402,9 @@ impl<'a> VecDbFile<'a> {
         }
     }
 }
+
+impl panic::UnwindSafe for VecDbFile<'_> {}
+impl panic::RefUnwindSafe for VecDbFile<'_> {}
 
 /// IO Methods for the `vec_db` Virtual File System.
 /// This can't be a const because the pointers are compared.
@@ -458,8 +467,9 @@ unsafe fn catch_unwind_sqlite_error(
     file: *mut ffi::sqlite3_file,
     f: impl FnOnce(&mut VecDbFile) -> c_int + panic::UnwindSafe,
 ) -> c_int {
-    panic::catch_unwind(|| f(&mut *(file as *mut VecDbFile))).unwrap_or_else(|e| {
-        dbg!(e);
+    let file = file as *mut VecDbFile;
+    panic::catch_unwind(|| f(&mut *file)).unwrap_or_else(|e| {
+        (*file).panics.push(e);
         ffi::SQLITE_ERROR
     })
 }
@@ -1104,6 +1114,17 @@ mod test {
         assert_eq!(size, db.serialize_rc(DatabaseName::Main).unwrap().len());
         db.execute_batch(sql).expect("enlarge should succeed");
         assert_ne!(size, db.serialize_rc(DatabaseName::Main).unwrap().len());
+        let err = db.unwrap().close().expect_err("panics").1;
+        assert_eq!(
+            err,
+            Error::SqliteFailure(
+                ffi::Error {
+                    code: ffi::ErrorCode::Unknown,
+                    extended_code: 1
+                },
+                Some("catch_unwind [called `Result::unwrap()` on an `Err` value: TryFromIntError(())]".to_string())
+            )
+        );
         Ok(())
     }
 
@@ -1213,7 +1234,12 @@ mod test {
     #[test]
     fn test_vec_db_write_zero_past_len() -> Result<()> {
         unsafe {
-            let mut vec_db = VecDbFile::new(MemFile::Owned(Vec::new()), usize::MAX);
+            let conn = Connection::open_in_memory()?;
+            let mut vec_db = VecDbFile::new(
+                MemFile::Owned(Vec::new()),
+                usize::MAX,
+                &mut conn.db.borrow_mut(),
+            );
             let file = &mut vec_db as *mut _ as *mut ffi::sqlite3_file;
             let write = (*vec_db.methods).xWrite.unwrap();
             let buf = &[11u8, 22, 33];

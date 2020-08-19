@@ -17,6 +17,8 @@ use crate::raw_statement::RawStatement;
 use crate::statement::Statement;
 use crate::unlock_notify;
 
+pub type Panics = Vec<Box<dyn std::any::Any + Send + 'static>>;
+
 pub struct InnerConnection {
     pub db: *mut ffi::sqlite3,
     // It's unsafe to call `sqlite3_close` while another thread is performing
@@ -32,6 +34,7 @@ pub struct InnerConnection {
     pub free_rollback_hook: Option<unsafe fn(*mut ::std::os::raw::c_void)>,
     #[cfg(feature = "hooks")]
     pub free_update_hook: Option<unsafe fn(*mut ::std::os::raw::c_void)>,
+    pub panics: Box<Panics>,
     owned: bool,
 }
 
@@ -47,6 +50,7 @@ impl InnerConnection {
             free_rollback_hook: None,
             #[cfg(feature = "hooks")]
             free_update_hook: None,
+            panics: Box::new(Vec::new()),
             owned,
         }
     }
@@ -149,9 +153,30 @@ impl InnerConnection {
             !shared_handle.is_null(),
             "Bug: Somehow interrupt_lock was cleared before the DB was closed"
         );
+        let panics_err = if !self.panics.is_empty() {
+            let e = Err(error_from_sqlite_code(
+                ffi::SQLITE_ERROR,
+                Some(format!(
+                    "catch_unwind [{}]",
+                    self.panics
+                        .iter()
+                        .map(|p| p
+                            .downcast_ref::<String>()
+                            .map(|s| &s[..])
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| *s))
+                            .unwrap_or("Any"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            ));
+            self.panics.clear();
+            e
+        } else {
+            Ok(())
+        };
         if !self.owned {
             self.db = ptr::null_mut();
-            return Ok(());
+            return panics_err;
         }
         unsafe {
             let r = ffi::sqlite3_close(self.db);
@@ -162,7 +187,7 @@ impl InnerConnection {
                 *shared_handle = ptr::null_mut();
                 self.db = ptr::null_mut();
             }
-            r
+            r.and(panics_err)
         }
     }
 
