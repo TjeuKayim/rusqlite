@@ -585,7 +585,7 @@ unsafe extern "C" fn c_size(file: *mut ffi::sqlite3_file, size: *mut i64) -> c_i
 unsafe extern "C" fn c_lock(file: *mut ffi::sqlite3_file, lock: c_int) -> c_int {
     catch_unwind_sqlite_error(file, |file| {
         let lock = lock_cast(lock);
-        debug_assert!(lock > file.lock);
+        debug_assert!(lock >= file.lock);
         debug_assert_eq!(ffi::SQLITE_LOCK_SHARED, 1);
         if lock > 1 && MemFile::get_mut_vec(&mut file.data).is_none() {
             ffi::SQLITE_READONLY
@@ -1234,6 +1234,34 @@ mod test {
             write(file, buf.as_ptr() as *const _, buf.len() as _, 4);
             assert_eq!(vec_db.data.as_slice(), &[0, 0, 0, 0, 11, 22, 33]);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialize_wal() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        dbg!("hello world");
+        db.deserialize(DatabaseName::Main, vec![])?;
+        db.execute_batch("CREATE TABLE foo(x INTEGER)")?;
+        let journal_mode: String = db.query_row("PRAGMA journal_mode", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!("memory", &journal_mode);
+        dbg!("try without EXCLUSIVE");
+        let journal_mode: String = db.query_row("PRAGMA journal_mode=WAL", NO_PARAMS, |r| r.get(0))?;
+        // the VFS does not support the necessary shared-memory primitives
+        // https://www.sqlite.org/wal.html#use_of_wal_without_shared_memory
+        assert_eq!("memory", &journal_mode);
+        dbg!("set locking_mode=EXCLUSIVE");
+        let locking_mode: String = db.query_row("PRAGMA locking_mode=EXCLUSIVE", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!("exclusive", &locking_mode);
+        let journal_mode: String = db.query_row("PRAGMA journal_mode=WAL", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!("wal", &journal_mode);
+        dbg!("changed to wal");
+        // writing now results in STATUS_ACCESS_VIOLATION
+        db.execute_batch("CREATE TABLE bar(x INTEGER)")?;
+        // let journal_mode: String = db.query_row("PRAGMA journal_mode=MEMORY", NO_PARAMS, |r| r.get(0))?;
+        // assert_eq!("memory", &journal_mode);
+        // db.execute_batch("CREATE TABLE bar(x INTEGER)")?;
+
         Ok(())
     }
 }
