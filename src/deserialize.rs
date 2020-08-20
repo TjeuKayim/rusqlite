@@ -426,14 +426,14 @@ static VEC_DB_IO_METHODS: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     xFileSize: Some(c_size),
     xLock: Some(c_lock),
     xUnlock: Some(c_unlock),
-    xCheckReservedLock: None,
+    xCheckReservedLock: Some(c_check_reserved_lock),
     xFileControl: Some(c_file_control),
-    xSectorSize: None,
+    xSectorSize: Some(c_sector_size),
     xDeviceCharacteristics: Some(c_device_characteristics),
-    xShmMap: None,
-    xShmLock: None,
-    xShmBarrier: None,
-    xShmUnmap: None,
+    xShmMap: Some(c_shm_map),
+    xShmLock: Some(c_shm_lock),
+    xShmBarrier: Some(c_shm_barrier),
+    xShmUnmap: Some(c_shm_unmap),
     xFetch: Some(c_fetch),
     xUnfetch: Some(c_unfetch),
 };
@@ -585,7 +585,9 @@ unsafe extern "C" fn c_size(file: *mut ffi::sqlite3_file, size: *mut i64) -> c_i
 unsafe extern "C" fn c_lock(file: *mut ffi::sqlite3_file, lock: c_int) -> c_int {
     catch_unwind_sqlite_error(file, |file| {
         let lock = lock_cast(lock);
-        debug_assert!(lock >= file.lock);
+        if lock <= file.lock {
+            return ffi::SQLITE_OK;
+        }
         debug_assert_eq!(ffi::SQLITE_LOCK_SHARED, 1);
         if lock > 1 && MemFile::get_mut_vec(&mut file.data).is_none() {
             ffi::SQLITE_READONLY
@@ -610,6 +612,10 @@ fn lock_cast(lock: c_int) -> u8 {
     debug_assert_eq!(ffi::SQLITE_LOCK_EXCLUSIVE, 4);
     assert!(lock <= 4);
     lock as u8
+}
+
+unsafe extern "C" fn c_check_reserved_lock(file: *mut ffi::sqlite3_file, p: *mut c_int) -> c_int {
+    ffi::SQLITE_ERROR
 }
 
 /// File control method.
@@ -648,12 +654,28 @@ unsafe extern "C" fn c_file_control(
     })
 }
 
+unsafe extern "C" fn c_sector_size(_file: *mut ffi::sqlite3_file) -> c_int {
+    0
+}
+
 /// Return the device characteristic flags supported.
 unsafe extern "C" fn c_device_characteristics(_file: *mut ffi::sqlite3_file) -> c_int {
     ffi::SQLITE_IOCAP_ATOMIC
         | ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
         | ffi::SQLITE_IOCAP_SAFE_APPEND
         | ffi::SQLITE_IOCAP_SEQUENTIAL
+}
+
+unsafe extern "C" fn c_shm_map(_file: *mut ffi::sqlite3_file, _pg: c_int, _sz: c_int, _extend: c_int, p: *mut *mut c_void) -> c_int {
+    // *p = ptr::null_mut();
+    ffi::SQLITE_ERROR
+}
+unsafe extern "C" fn c_shm_lock(_file: *mut ffi::sqlite3_file, _ofst: c_int, _n: c_int, _flags: c_int) -> c_int {
+    ffi::SQLITE_ERROR
+}
+unsafe extern "C" fn c_shm_barrier(_file: *mut ffi::sqlite3_file) {}
+unsafe extern "C" fn c_shm_unmap(_file: *mut ffi::sqlite3_file, _delete: c_int) -> c_int {
+    ffi::SQLITE_ERROR
 }
 
 /// Fetch a page of a memory-mapped file.
@@ -1245,22 +1267,22 @@ mod test {
         db.execute_batch("CREATE TABLE foo(x INTEGER)")?;
         let journal_mode: String = db.query_row("PRAGMA journal_mode", NO_PARAMS, |r| r.get(0))?;
         assert_eq!("memory", &journal_mode);
-        dbg!("try without EXCLUSIVE");
-        let journal_mode: String = db.query_row("PRAGMA journal_mode=WAL", NO_PARAMS, |r| r.get(0))?;
-        // the VFS does not support the necessary shared-memory primitives
-        // https://www.sqlite.org/wal.html#use_of_wal_without_shared_memory
-        assert_eq!("memory", &journal_mode);
-        dbg!("set locking_mode=EXCLUSIVE");
+        // dbg!("try without EXCLUSIVE");
+        // let journal_mode: String = db.query_row("PRAGMA journal_mode=WAL", NO_PARAMS, |r| r.get(0))?;
+        // // the VFS does not support the necessary shared-memory primitives
+        // // https://www.sqlite.org/wal.html#use_of_wal_without_shared_memory
+        // assert_eq!("memory", &journal_mode);
+        // dbg!("set locking_mode=EXCLUSIVE");
         let locking_mode: String = db.query_row("PRAGMA locking_mode=EXCLUSIVE", NO_PARAMS, |r| r.get(0))?;
         assert_eq!("exclusive", &locking_mode);
         let journal_mode: String = db.query_row("PRAGMA journal_mode=WAL", NO_PARAMS, |r| r.get(0))?;
         assert_eq!("wal", &journal_mode);
         dbg!("changed to wal");
         // writing now results in STATUS_ACCESS_VIOLATION
-        db.execute_batch("CREATE TABLE bar(x INTEGER)")?;
-        // let journal_mode: String = db.query_row("PRAGMA journal_mode=MEMORY", NO_PARAMS, |r| r.get(0))?;
-        // assert_eq!("memory", &journal_mode);
+        let journal_mode: String = db.query_row("PRAGMA journal_mode=MEMORY", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!("memory", &journal_mode);
         // db.execute_batch("CREATE TABLE bar(x INTEGER)")?;
+        db.execute_batch("CREATE TABLE bar(x INTEGER)")?;
 
         Ok(())
     }
