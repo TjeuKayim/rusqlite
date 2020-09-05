@@ -1165,6 +1165,53 @@ mod test {
     }
 
     #[test]
+    fn test_serialize_wal_journal() -> Result<()> {
+        // WAL journal mode is apparently not supported for in-memory databases.
+        let db = Connection::open_in_memory().unwrap().into_borrowing();
+        let mut mem_file = db.serialize(DatabaseName::Main)?;
+        db.deserialize_writable(DatabaseName::Main, &mut mem_file)?;
+        db.execute_batch("CREATE TABLE foo(x INTEGER); INSERT INTO foo VALUES(4026)")?;
+
+        fn select(db: &Connection) -> Result<i16> {
+            db.query_row("SELECT * FROM foo", NO_PARAMS, |r| r.get(0))
+        }
+        assert_eq!(select(&db)?, 4026);
+
+        // If you try to change change the journal_mode, it fails.
+        let journal_mode: String =
+            db.query_row("PRAGMA journal_mode = wal", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!(journal_mode, "memory");
+        // However, what if you load WAL-enabled .sqlite-file into memory?
+        // This is determined by offsets 18 and 19 in the Database Header Format.
+        assert!(mem_file.starts_with(b"SQLite format 3\0"), "Invalid header");
+        // Set file format read/write version numbers to 2 for journal mode WAL.
+        mem_file[18..20].copy_from_slice(&[2, 2]);
+        // Create a second db connection and try to load this WAL database.
+        let db = Connection::open_in_memory().unwrap().into_borrowing();
+        db.deserialize_writable(DatabaseName::Main, &mut mem_file)?;
+        assert_eq!(
+            select(&db).unwrap_err(),
+            Error::SqliteFailure(
+                ffi::Error {
+                    code: ffi::ErrorCode::CannotOpen,
+                    extended_code: 14
+                },
+                Some("unable to open database file".to_string())
+            )
+        );
+        // This is because the VFS does not support shared memory.
+        // https://sqlite.org/wal.html#use_of_wal_without_shared_memory
+        // Let's apply the suggestion and set locking_mode to exclusive.
+        let db = Connection::open_in_memory().unwrap().into_borrowing();
+        let journal_mode: String =
+            db.query_row("PRAGMA locking_mode = exclusive", NO_PARAMS, |r| r.get(0))?;
+        assert_eq!(journal_mode, "exclusive");
+        db.deserialize_writable(DatabaseName::Main, &mut mem_file)?;
+        // let _ = select(&db); // uncommenting this results in a segfault.
+        Ok(())
+    }
+
+    #[test]
     fn test_vec_db_fetch() -> Result<()> {
         let db = Connection::open_in_memory().unwrap().into_borrowing();
         db.execute_batch("CREATE TABLE a(x INTEGER)")?;
