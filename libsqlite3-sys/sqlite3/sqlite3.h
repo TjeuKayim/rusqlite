@@ -9731,6 +9731,7 @@ SQLITE_API unsigned char *sqlite3_serialize(
 ** prior call to [sqlite3_deserialize()].
 */
 #define SQLITE_SERIALIZE_NOCOPY 0x001   /* Do no memory allocations */
+#define SQLITE_SERIALIZE_BYOB   0x010   /* Bring your own buffer */
 
 /*
 ** CAPI3REF: Deserialize a database

@@ -38,7 +38,7 @@ use std::{alloc, borrow::Cow, convert::TryInto, fmt, mem, ops, panic, ptr, rc::R
 
 use crate::inner_connection::InnerConnection;
 use crate::util::SmallCString;
-use crate::{error, ffi, Connection, DatabaseName, OpenFlags, Result, NO_PARAMS};
+use crate::{error, ffi, Connection, DatabaseName, Result, NO_PARAMS};
 
 impl Connection {
     /// Disconnects from database and reopen as an in-memory database based on `Vec<u8>`.
@@ -113,12 +113,24 @@ impl Connection {
             return Ok(Vec::new());
         }
         let mut vec = Vec::with_capacity(db_size);
-
-        // Unfortunately, sqlite3PagerGet and sqlite3PagerGetData are private APIs,
-        // so the Backup API is used instead.
-        backup_to_vec(&mut vec, self, db_name)?;
-        assert_eq!(vec.len(), db_size, "serialize backup size mismatch");
-
+        unsafe {
+            #[repr(C)]
+            struct Buffer {
+                sz: ffi::sqlite3_int64,
+                p: *mut u8,
+            }
+            let p = ffi::sqlite3_serialize(
+                self.db.borrow().db(),
+                schema.as_ptr(),
+                &mut Buffer {
+                    sz: db_size as _,
+                    p: vec.as_mut_ptr(),
+                } as *mut _ as _,
+                ffi::SQLITE_SERIALIZE_BYOB as _,
+            );
+            assert_eq!(p, vec.as_mut_ptr(), "sqlite3_serialize BYOB failed");
+            vec.set_len(db_size);
+        }
         Ok(vec)
     }
 
@@ -231,35 +243,6 @@ fn err_not_found(db_name: &SmallCString) -> error::Error {
         1,
         Some(format!("database {:?} not found", db_name.as_str())),
     )
-}
-
-fn backup_to_vec(vec: &mut Vec<u8>, src: &Connection, db_name: DatabaseName<'_>) -> Result<()> {
-    let mut temp_db = Connection::open_with_flags_and_vfs("0", OpenFlags::default(), "memdb")?;
-    unsafe {
-        let temp_file = file_ptr(&temp_db.db.borrow_mut(), &SmallCString::new("main")?).unwrap();
-        assert_eq!(temp_file.pMethods, *MEMDB_IO_METHODS);
-        // At this point, MemFile->aData is null
-        ptr::write(
-            temp_file as *mut _ as _,
-            VecDbFile::new(MemFile::Writable(vec), 0),
-        );
-    };
-
-    use crate::backup::{
-        Backup,
-        StepResult::{Busy, Done, Locked, More},
-    };
-    let backup = Backup::new_with_names(src, db_name, &mut temp_db, DatabaseName::Main)?;
-    let mut r = More;
-    while r == More {
-        r = backup.step(100)?;
-    }
-    match r {
-        Done => Ok(()),
-        Busy => Err(unsafe { error::error_from_handle(ptr::null_mut(), ffi::SQLITE_BUSY) }),
-        Locked => Err(unsafe { error::error_from_handle(ptr::null_mut(), ffi::SQLITE_LOCKED) }),
-        More => unreachable!(),
-    }
 }
 
 /// Wrapper around [`Connection`] with lifetime constraint to serialize/deserialize
